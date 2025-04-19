@@ -6,12 +6,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"sort"
+
+	"os/signal"
+	"syscall"
 
 	log "github.com/ipfs/go-log/v2"
 	"github.com/libp2p/go-libp2p"
@@ -51,24 +55,118 @@ const (
 	mdnsServiceTag       = "p2pchat-poc" // Tag para o serviço mDNS
 )
 
-var (
-	topicNameFlag   = flag.String("topicName", "applesauce_crg_y", "name of topic to join")
-	connected       = make(map[peer.ID]bool)
-	ignore          = make(map[peer.ID]bool)
+// P2PNode encapsula toda a funcionalidade de um nó P2P
+type P2PNode struct {
+	// Configuração
+	topicName string
+	keyFile   string
+	peersFile string
+
+	// Componentes libp2p
+	host   host.Host
+	dht    *dht.IpfsDHT
+	pubsub *pubsub.PubSub
+	topic  *pubsub.Topic
+
+	// Estado interno com proteção contra concorrência
+	connectedMutex sync.RWMutex
+	connected      map[peer.ID]bool
+
+	ignoreMutex sync.RWMutex
+	ignore      map[peer.ID]bool
+
 	knownPeersMutex sync.RWMutex
 	lastSavedPeers  KnownPeers
-)
 
-// Lista de relays estáticos que podem ser usados quando direto peer-to-peer falha
-var staticRelays = []string{
-	"/ip4/147.75.80.110/tcp/4001/p2p/QmbFgm5rao4mLdUAaCPgRGRoqyMKfK2gCgQaT77PmPjsEY",
-	"/ip4/147.75.195.153/tcp/4001/p2p/QmW9m57aiBDHAkKj9nmFSEn7ZqrcF1fZS4bipsTCHburei",
-	"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-	"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+	// Controle de contexto
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// Lista de relays estáticos
+	staticRelays []string
+}
+
+// NewP2PNode cria uma nova instância de P2PNode
+func NewP2PNode(topicName, keyFile, peersFile string) *P2PNode {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	return &P2PNode{
+		topicName:    topicName,
+		keyFile:      keyFile,
+		peersFile:    peersFile,
+		connected:    make(map[peer.ID]bool),
+		ignore:       make(map[peer.ID]bool),
+		ctx:          ctx,
+		cancel:       cancel,
+		staticRelays: DefaultStaticRelays(),
+	}
+}
+
+// DefaultStaticRelays retorna a lista padrão de relays estáticos
+func DefaultStaticRelays() []string {
+	return []string{
+		"/ip4/147.75.80.110/tcp/4001/p2p/QmbFgm5rao4mLdUAaCPgRGRoqyMKfK2gCgQaT77PmPjsEY",
+		"/ip4/147.75.195.153/tcp/4001/p2p/QmW9m57aiBDHAkKj9nmFSEn7ZqrcF1fZS4bipsTCHburei",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+	}
+}
+
+// SetStaticRelays permite substituir a lista de relays estáticos
+func (node *P2PNode) SetStaticRelays(relays []string) {
+	node.staticRelays = relays
+}
+
+// IsConnected verifica se um peer está conectado
+func (node *P2PNode) IsConnected(peerID peer.ID) bool {
+	node.connectedMutex.RLock()
+	defer node.connectedMutex.RUnlock()
+	return node.connected[peerID]
+}
+
+// SetConnected marca um peer como conectado
+func (node *P2PNode) SetConnected(peerID peer.ID, connected bool) {
+	node.connectedMutex.Lock()
+	defer node.connectedMutex.Unlock()
+	if connected {
+		node.connected[peerID] = true
+	} else {
+		delete(node.connected, peerID)
+	}
+}
+
+// IsIgnored verifica se um peer deve ser ignorado
+func (node *P2PNode) IsIgnored(peerID peer.ID) bool {
+	node.ignoreMutex.RLock()
+	defer node.ignoreMutex.RUnlock()
+	return node.ignore[peerID]
+}
+
+// SetIgnored marca um peer para ser ignorado ou não
+func (node *P2PNode) SetIgnored(peerID peer.ID, ignored bool) {
+	node.ignoreMutex.Lock()
+	defer node.ignoreMutex.Unlock()
+	if ignored {
+		node.ignore[peerID] = true
+	} else {
+		delete(node.ignore, peerID)
+	}
+}
+
+// GetConnectedPeers retorna uma lista de todos os peers conectados
+func (node *P2PNode) GetConnectedPeers() []peer.ID {
+	node.connectedMutex.RLock()
+	defer node.connectedMutex.RUnlock()
+
+	peers := make([]peer.ID, 0, len(node.connected))
+	for peerID := range node.connected {
+		peers = append(peers, peerID)
+	}
+	return peers
 }
 
 // Converte strings de endereços para peer.AddrInfo
-func convertToAddrInfo(addresses []string) []peer.AddrInfo {
+func (node *P2PNode) convertToAddrInfo(addresses []string) []peer.AddrInfo {
 	var addrInfos []peer.AddrInfo
 	for _, addrStr := range addresses {
 		addr, err := ma.NewMultiaddr(addrStr)
@@ -88,20 +186,20 @@ func convertToAddrInfo(addresses []string) []peer.AddrInfo {
 }
 
 // Carregar peers conhecidos do disco
-func loadKnownPeers() []peer.AddrInfo {
-	knownPeersMutex.RLock()
-	defer knownPeersMutex.RUnlock()
+func (node *P2PNode) loadKnownPeers() []peer.AddrInfo {
+	node.knownPeersMutex.RLock()
+	defer node.knownPeersMutex.RUnlock()
 
 	var knownPeers KnownPeers
 
-	data, err := os.ReadFile(PeersFile)
+	data, err := os.ReadFile(node.peersFile)
 	if err != nil {
 		// Inicializa uma estrutura vazia se o arquivo não existir
 		knownPeers = KnownPeers{
 			Peers:        make(map[string]KnownPeer),
 			LastModified: time.Now(),
 		}
-		lastSavedPeers = knownPeers
+		node.lastSavedPeers = knownPeers
 		return nil
 	}
 
@@ -114,7 +212,7 @@ func loadKnownPeers() []peer.AddrInfo {
 		}
 	}
 
-	lastSavedPeers = knownPeers
+	node.lastSavedPeers = knownPeers
 
 	// Filtrar peers antigos (mais de 7 dias sem conexão)
 	now := time.Now()
@@ -143,27 +241,27 @@ func loadKnownPeers() []peer.AddrInfo {
 }
 
 // Salvar peers conhecidos no disco
-func saveKnownPeers(h host.Host) {
-	knownPeersMutex.Lock()
-	defer knownPeersMutex.Unlock()
+func (node *P2PNode) saveKnownPeers() {
+	node.knownPeersMutex.Lock()
+	defer node.knownPeersMutex.Unlock()
 
 	// Carregue a estrutura atual se ainda não inicializada
 	var knownPeers KnownPeers
-	if lastSavedPeers.Peers == nil {
+	if node.lastSavedPeers.Peers == nil {
 		knownPeers = KnownPeers{
 			Peers:        make(map[string]KnownPeer),
 			LastModified: time.Now(),
 		}
 	} else {
-		knownPeers = lastSavedPeers
+		knownPeers = node.lastSavedPeers
 	}
 
 	changed := false
 	now := time.Now()
 
 	// Atualiza peers conectados
-	for peerID := range connected {
-		peer := h.Peerstore().PeerInfo(peerID)
+	for peerID := range node.connected {
+		peer := node.host.Peerstore().PeerInfo(peerID)
 
 		// Escolhe o melhor endereço para este peer
 		// Prefere endereços não-locais para maior estabilidade
@@ -220,11 +318,11 @@ func saveKnownPeers(h host.Host) {
 			return
 		}
 
-		err = os.WriteFile(PeersFile, data, 0644)
+		err = os.WriteFile(node.peersFile, data, 0644)
 		if err != nil {
 			fmt.Printf("Erro ao salvar peers conhecidos: %s\n", err)
 		} else {
-			lastSavedPeers = knownPeers
+			node.lastSavedPeers = knownPeers
 		}
 	}
 }
@@ -283,25 +381,35 @@ func isLocalAddress(addr ma.Multiaddr) bool {
 		strings.Contains(addr.String(), "/ip4/172.16.")
 }
 
-func loadOrCreateIdentity() crypto.PrivKey {
-	if _, err := os.Stat(KeyFile); os.IsNotExist(err) {
+// Calcula o próximo tempo de espera para backoff exponencial
+func nextBackoff(attempt int) time.Duration {
+	backoffDuration := initialBackoff * time.Duration(1<<uint(attempt))
+	if backoffDuration > maxBackoff {
+		backoffDuration = maxBackoff
+	}
+	return backoffDuration
+}
+
+// LoadOrCreateIdentity carrega ou cria identidade do nó
+func (node *P2PNode) LoadOrCreateIdentity() crypto.PrivKey {
+	if _, err := os.Stat(node.keyFile); os.IsNotExist(err) {
 		fmt.Println("Arquivo de chaves não encontrado. Gerando novas chaves...")
 		priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
 		if err != nil {
 			panic(err)
 		}
-		saveKeyToFile(priv)
+		node.saveKeyToFile(priv)
 		return priv
 	}
 
-	keyBytes, err := os.ReadFile(KeyFile)
+	keyBytes, err := os.ReadFile(node.keyFile)
 	if err != nil {
 		fmt.Printf("Erro ao ler chaves: %s. Gerando novas chaves...\n", err)
 		priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
 		if err != nil {
 			panic(err)
 		}
-		saveKeyToFile(priv)
+		node.saveKeyToFile(priv)
 		return priv
 	}
 
@@ -312,7 +420,7 @@ func loadOrCreateIdentity() crypto.PrivKey {
 		if err != nil {
 			panic(err)
 		}
-		saveKeyToFile(priv)
+		node.saveKeyToFile(priv)
 		return priv
 	}
 
@@ -320,24 +428,25 @@ func loadOrCreateIdentity() crypto.PrivKey {
 	return priv
 }
 
-func saveKeyToFile(priv crypto.PrivKey) error {
+func (node *P2PNode) saveKeyToFile(priv crypto.PrivKey) error {
 	keyBytes, err := crypto.MarshalPrivateKey(priv)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(KeyFile, keyBytes, 0600)
+	return os.WriteFile(node.keyFile, keyBytes, 0600)
 }
 
-func initDHT(ctx context.Context, h host.Host) *dht.IpfsDHT {
+// InitDHT inicializa o DHT para descoberta de peers
+func (node *P2PNode) InitDHT() *dht.IpfsDHT {
 	// Start a DHT, for use in peer discovery. We can't just make a new DHT
 	// client because we want each peer to maintain its own local copy of the
 	// DHT, so that the bootstrapping node of the DHT can go down without
 	// inhibiting future peer discovery.
-	kademliaDHT, err := dht.New(ctx, h, dht.MaxRecordAge(5*time.Second))
+	kademliaDHT, err := dht.New(node.ctx, node.host, dht.MaxRecordAge(5*time.Second))
 	if err != nil {
 		panic(err)
 	}
-	err = kademliaDHT.Bootstrap(ctx)
+	err = kademliaDHT.Bootstrap(node.ctx)
 	if err != nil {
 		panic(err)
 	}
@@ -347,7 +456,7 @@ func initDHT(ctx context.Context, h host.Host) *dht.IpfsDHT {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := h.Connect(ctx, *peerinfo)
+			err := node.host.Connect(node.ctx, *peerinfo)
 			if err != nil {
 				fmt.Println("Bootstrap warning:", err)
 			}
@@ -355,10 +464,48 @@ func initDHT(ctx context.Context, h host.Host) *dht.IpfsDHT {
 	}
 	wg.Wait()
 
+	node.dht = kademliaDHT
 	return kademliaDHT
 }
 
-func discoverPeers(ctx context.Context, h host.Host) {
+// MDNSNotifee implementa interface de notificação de descoberta para mDNS
+type MDNSNotifee struct {
+	node *P2PNode
+}
+
+// HandlePeerFound é chamada quando mDNS descobre um novo peer
+func (n *MDNSNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if pi.ID == n.node.host.ID() {
+		return // Ignora auto-descoberta
+	}
+
+	fmt.Printf("Peer encontrado via mDNS: %s\n", pi.ID)
+
+	// Tenta se conectar ao peer descoberto
+	err := n.node.host.Connect(context.Background(), pi)
+	if err != nil {
+		fmt.Printf("Falha ao conectar via mDNS com %s: %s\n", pi.ID, err)
+		return
+	}
+
+	fmt.Printf("Conectado via mDNS com %s\n", pi.ID)
+	n.node.SetConnected(pi.ID, true)
+}
+
+// SetupMDNS inicia serviço de descoberta mDNS
+func (node *P2PNode) SetupMDNS() error {
+	// Configurar serviço mDNS para descoberta local
+	service := mdns.NewMdnsService(node.host, mdnsServiceTag, &MDNSNotifee{node: node})
+	if service == nil {
+		return fmt.Errorf("falha ao criar serviço mDNS")
+	}
+
+	fmt.Println("Serviço de descoberta local mDNS iniciado")
+	return nil
+}
+
+// DiscoverPeers implementa a descoberta contínua de peers
+func (node *P2PNode) DiscoverPeers() {
 	// Armazena tentativas de reconexão por peer
 	reconnectAttempts := make(map[peer.ID]int)
 	lastAttempt := make(map[peer.ID]time.Time)
@@ -371,47 +518,54 @@ func discoverPeers(ctx context.Context, h host.Host) {
 		for {
 			select {
 			case <-ticker.C:
-				saveKnownPeers(h)
-			case <-ctx.Done():
+				node.saveKnownPeers()
+			case <-node.ctx.Done():
 				return
 			}
 		}
 	}()
 
-	kademliaDHT := initDHT(ctx, h)
-	routingDiscovery := drouting.NewRoutingDiscovery(kademliaDHT)
+	// Inicializa DHT se ainda não estiver inicializado
+	if node.dht == nil {
+		node.InitDHT()
+	}
+	routingDiscovery := drouting.NewRoutingDiscovery(node.dht)
 
 	for {
-		dutil.Advertise(ctx, routingDiscovery, *topicNameFlag)
+		select {
+		case <-node.ctx.Done():
+			return
+		default:
+			// Continua execução normal
+		}
+
+		dutil.Advertise(node.ctx, routingDiscovery, node.topicName)
 
 		// Tenta reconectar aos peers conhecidos
-		knownPeers := loadKnownPeers()
+		knownPeers := node.loadKnownPeers()
 		now := time.Now()
 
 		// Reconexão com peers conhecidos
 		for _, peerInfo := range knownPeers {
-			if peerInfo.ID == h.ID() {
+			if peerInfo.ID == node.host.ID() {
 				continue
 			}
 
-			if _, ok := connected[peerInfo.ID]; ok {
+			if node.IsConnected(peerInfo.ID) {
 				continue // Já conectado
 			}
 
 			// Verifica se atingiu o limite de tentativas
 			if attempts, exists := reconnectAttempts[peerInfo.ID]; exists && attempts >= maxReconnectAttempts {
 				fmt.Printf("Desistindo de reconexão com %s após %d tentativas\n", peerInfo.ID, attempts)
-				ignore[peerInfo.ID] = true
+				node.SetIgnored(peerInfo.ID, true)
 				continue
 			}
 
 			// Aplica backoff exponencial
 			if lastTime, exists := lastAttempt[peerInfo.ID]; exists {
 				attempts := reconnectAttempts[peerInfo.ID]
-				backoffDuration := initialBackoff * time.Duration(1<<uint(attempts))
-				if backoffDuration > maxBackoff {
-					backoffDuration = maxBackoff
-				}
+				backoffDuration := nextBackoff(attempts)
 
 				if now.Sub(lastTime) < backoffDuration {
 					continue // Ainda não é hora de tentar novamente
@@ -419,12 +573,12 @@ func discoverPeers(ctx context.Context, h host.Host) {
 			}
 
 			// Tenta reconectar
-			err := h.Connect(ctx, peerInfo)
+			err := node.host.Connect(node.ctx, peerInfo)
 			if err == nil {
 				fmt.Printf("Reconectado com sucesso ao peer conhecido: %s\n", peerInfo.ID)
-				connected[peerInfo.ID] = true
+				node.SetConnected(peerInfo.ID, true)
 				delete(reconnectAttempts, peerInfo.ID)
-				delete(ignore, peerInfo.ID)
+				node.SetIgnored(peerInfo.ID, false)
 				delete(lastAttempt, peerInfo.ID)
 			} else {
 				fmt.Printf("Falha na reconexão com %s: %s\n", peerInfo.ID, err)
@@ -434,8 +588,9 @@ func discoverPeers(ctx context.Context, h host.Host) {
 		}
 
 		// Tentar reconectar peers ignorados anteriormente
-		for peerID := range ignore {
-			if _, ok := connected[peerID]; ok {
+		ignoredPeers := node.GetIgnoredPeers()
+		for _, peerID := range ignoredPeers {
+			if node.IsConnected(peerID) {
 				continue // Já está conectado
 			}
 
@@ -447,8 +602,7 @@ func discoverPeers(ctx context.Context, h host.Host) {
 			// Aplica backoff exponencial
 			if lastTime, exists := lastAttempt[peerID]; exists {
 				attempts := reconnectAttempts[peerID]
-				backoffDuration := initialBackoff * time.Duration(1<<uint(attempts))
-				backoffDuration = max(backoffDuration, maxBackoff)
+				backoffDuration := nextBackoff(attempts)
 
 				if now.Sub(lastTime) < backoffDuration {
 					continue // Ainda não é hora de tentar novamente
@@ -456,8 +610,7 @@ func discoverPeers(ctx context.Context, h host.Host) {
 			}
 
 			// Tenta encontrar o peer diretamente usando o DHT
-			// Corrigindo problema: RoutingDiscovery não tem método FindPeer
-			peerInfo, err := kademliaDHT.FindPeer(ctx, peerID)
+			peerInfo, err := node.dht.FindPeer(node.ctx, peerID)
 			if err != nil {
 				fmt.Printf("Não foi possível encontrar o peer %s: %s\n", peerID, err)
 				reconnectAttempts[peerID]++
@@ -465,12 +618,12 @@ func discoverPeers(ctx context.Context, h host.Host) {
 				continue
 			}
 
-			err = h.Connect(ctx, peerInfo)
+			err = node.host.Connect(node.ctx, peerInfo)
 			if err == nil {
 				fmt.Printf("Reconexão bem-sucedida com peer anteriormente ignorado: %s\n", peerID)
-				connected[peerID] = true
+				node.SetConnected(peerID, true)
 				delete(reconnectAttempts, peerID)
-				delete(ignore, peerID)
+				node.SetIgnored(peerID, false)
 				delete(lastAttempt, peerID)
 			} else {
 				fmt.Printf("Falha na reconexão com peer ignorado %s: %s\n", peerID, err)
@@ -480,7 +633,7 @@ func discoverPeers(ctx context.Context, h host.Host) {
 		}
 
 		// Procura por novos peers
-		peerChan, err := routingDiscovery.FindPeers(ctx, *topicNameFlag)
+		peerChan, err := routingDiscovery.FindPeers(node.ctx, node.topicName)
 		if err != nil {
 			fmt.Printf("Erro na descoberta de peers: %s. Tentando novamente...\n", err)
 			time.Sleep(5 * time.Second)
@@ -489,22 +642,22 @@ func discoverPeers(ctx context.Context, h host.Host) {
 
 		// Processa novos peers encontrados
 		for peerInfo := range peerChan {
-			if peerInfo.ID == h.ID() {
+			if peerInfo.ID == node.host.ID() {
 				continue // Evitar auto-conexão
 			}
 
-			if _, ok := connected[peerInfo.ID]; ok {
+			if node.IsConnected(peerInfo.ID) {
 				continue // Já conectado
 			}
 
-			if _, ok := ignore[peerInfo.ID]; ok {
+			if node.IsIgnored(peerInfo.ID) {
 				continue // Ignorado anteriormente
 			}
 
-			err := h.Connect(ctx, peerInfo)
+			err := node.host.Connect(node.ctx, peerInfo)
 			if err != nil {
 				if err.Error() == "no addresses" {
-					ignore[peerInfo.ID] = true
+					node.SetIgnored(peerInfo.ID, true)
 					continue
 				}
 
@@ -515,7 +668,7 @@ func discoverPeers(ctx context.Context, h host.Host) {
 			}
 
 			fmt.Printf("Conectado com sucesso a novo peer: %s\n", peerInfo.ID)
-			connected[peerInfo.ID] = true
+			node.SetConnected(peerInfo.ID, true)
 		}
 
 		// Aguarda antes da próxima iteração
@@ -523,181 +676,298 @@ func discoverPeers(ctx context.Context, h host.Host) {
 	}
 }
 
-// Implementa interface de notificação de descoberta para mDNS
-type mdnsNotifee struct {
-	h host.Host
+// GetIgnoredPeers retorna uma lista de todos os peers ignorados
+func (node *P2PNode) GetIgnoredPeers() []peer.ID {
+	node.ignoreMutex.RLock()
+	defer node.ignoreMutex.RUnlock()
+
+	peers := make([]peer.ID, 0, len(node.ignore))
+	for peerID := range node.ignore {
+		peers = append(peers, peerID)
+	}
+	return peers
 }
 
-// Interface HandlePeerFound é chamada quando mDNS descobre um novo peer
-func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	if pi.ID == n.h.ID() {
-		return // Ignora auto-descoberta
-	}
+// Start inicia o nó P2P com todas as funcionalidades
+func (node *P2PNode) Start() error {
+	// Carrega ou cria identidade
+	priv := node.LoadOrCreateIdentity()
 
-	fmt.Printf("Peer encontrado via mDNS: %s\n", pi.ID)
+	// Configura e inicializa o host libp2p
+	staticRelaysInfo := node.convertToAddrInfo(node.staticRelays)
 
-	// Tenta se conectar ao peer descoberto
-	err := n.h.Connect(context.Background(), pi)
-	if err != nil {
-		fmt.Printf("Falha ao conectar via mDNS com %s: %s\n", pi.ID, err)
-		return
-	}
-
-	fmt.Printf("Conectado via mDNS com %s\n", pi.ID)
-	connected[pi.ID] = true
-}
-
-// Inicia serviço de descoberta mDNS
-func setupMDNS(h host.Host) error {
-	// Configurar serviço mDNS para descoberta local
-	service := mdns.NewMdnsService(h, mdnsServiceTag, &mdnsNotifee{h: h})
-	if service == nil {
-		return fmt.Errorf("falha ao criar serviço mDNS")
-	}
-
-	fmt.Println("Serviço de descoberta local mDNS iniciado")
-	return nil
-}
-
-func streamConsoleTo(ctx context.Context, topic *pubsub.Topic) {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		s, err := reader.ReadString('\n')
-		if err != nil {
-			panic(err)
-		}
-		err = topic.Publish(ctx, []byte(s))
-		if err != nil {
-			fmt.Println("### Publish error:", err)
-		}
-	}
-}
-
-func printMessagesFrom(ctx context.Context, sub *pubsub.Subscription) {
-	for {
-		m, err := sub.Next(ctx)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Println(m.ReceivedFrom, ": ", string(m.Message.Data))
-	}
-}
-
-func main() {
-	//log.SetAllLoggers(log.LevelWarn)
-	log.SetAllLoggers(log.LevelError)
-	flag.Parse()
-
-	ctx := context.Background()
-
-	priv := loadOrCreateIdentity()
-
-	// Converte os relays estáticos para o formato adequado
-	staticRelaysInfo := convertToAddrInfo(staticRelays)
-
-	// Configura lista de opções para o host libp2p
 	opts := []libp2p.Option{
-		// Escutar em múltiplos endereços e protocolos
 		libp2p.ListenAddrStrings(
 			"/ip4/0.0.0.0/tcp/0",
-			"/ip4/0.0.0.0/udp/0/quic-v1", // Suporte QUIC
-			"/ip4/0.0.0.0/tcp/0/ws",      // Suporte WebSocket
+			"/ip4/0.0.0.0/udp/0/quic-v1",
+			"/ip4/0.0.0.0/tcp/0/ws",
 		),
-		libp2p.NATPortMap(),                                      // Utiliza UPnP/PCP para mapeamento de portas
-		libp2p.EnableHolePunching(),                              // Habilita técnicas de hole-punching para atravessar NATs
-		libp2p.EnableRelayService(),                              // Permite que este nó forneça serviço relay v2
-		libp2p.EnableAutoRelayWithStaticRelays(staticRelaysInfo), // Usa relays estáticos para fallback
-		libp2p.ForceReachabilityPublic(),                         // Força modo público para melhorar descoberta
+		libp2p.NATPortMap(),
+		libp2p.EnableHolePunching(),
+		libp2p.EnableRelayService(),
+		libp2p.EnableAutoRelayWithStaticRelays(staticRelaysInfo),
+		libp2p.ForceReachabilityPublic(),
 		libp2p.Identity(priv),
 	}
 
-	h, err := libp2p.New(opts...)
+	host, err := libp2p.New(opts...)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("falha ao criar host libp2p: %w", err)
 	}
+	node.host = host
 
 	// Configura serviços adicionais
-
-	// Cria serviço relay com configurações simplificadas
-	// Como a API do relay parece ter mudado na sua versão, usamos uma versão mais simples
-	_, err = relay.New(h)
+	_, err = relay.New(host)
 	if err != nil {
-		fmt.Printf("Falha ao iniciar serviço relay: %s\n", err)
+		fmt.Printf("Aviso: falha ao iniciar serviço relay: %s\n", err)
 	}
 
-	// A API para holepunching também parece diferente na sua versão
-	// Vamos tentar uma abordagem mais compatível
-	// Primeiro, precisamos obter o serviço de identificação do host
-	ids, ok := h.Peerstore().(identify.IDService)
+	// Configura hole punching
+	ids, ok := host.Peerstore().(identify.IDService)
 	if !ok {
-		fmt.Println("Host não fornece serviço de identificação compatível")
+		fmt.Println("Aviso: host não fornece serviço de identificação compatível")
 	} else {
-		// Função para obter endereços
-		addrF := func() []ma.Multiaddr { return h.Addrs() }
-
-		// Cria o serviço holepunch sem tracer para evitar problemas de compatibilidade
-		_, err = holepunch.NewService(h, ids, addrF)
+		addrF := func() []ma.Multiaddr { return host.Addrs() }
+		_, err = holepunch.NewService(host, ids, addrF)
 		if err != nil {
-			fmt.Printf("Falha ao iniciar serviço de hole punch: %s\n", err)
+			fmt.Printf("Aviso: falha ao iniciar serviço de hole punch: %s\n", err)
 		} else {
 			fmt.Println("Serviço de hole punch iniciado com sucesso")
 		}
 	}
 
-	// Iniciar o serviço de descoberta local mDNS
-	err = setupMDNS(h)
+	// Configura mDNS para descoberta local
+	err = node.SetupMDNS()
 	if err != nil {
-		fmt.Printf("Falha ao iniciar serviço mDNS: %s\n", err)
+		fmt.Printf("Aviso: falha ao iniciar serviço mDNS: %s\n", err)
 	}
 
 	// Exibe informação do host
-	fmt.Printf("Peer ID: %s\n", h.ID())
-	for _, a := range h.Addrs() {
-		fmt.Printf("Address: %s/p2p/%s\n", a, h.ID())
+	fmt.Printf("Peer ID: %s\n", host.ID())
+	for _, a := range host.Addrs() {
+		fmt.Printf("Address: %s/p2p/%s\n", a, host.ID())
 	}
 
-	h.Network().Notify(&network.NotifyBundle{
+	// Configura notificações de rede
+	host.Network().Notify(&network.NotifyBundle{
 		DisconnectedF: func(n network.Network, c network.Conn) {
 			pid := c.RemotePeer()
-			// schedule reconnect
-			go func() { h.Connect(ctx, peer.AddrInfo{ID: pid}) }()
+			node.SetConnected(pid, false)
+			// Tenta reconectar
+			go func() {
+				err := host.Connect(node.ctx, peer.AddrInfo{ID: pid})
+				if err == nil {
+					node.SetConnected(pid, true)
+				}
+			}()
 		},
-		// Adiciona monitoramento de conexões
 		ConnectedF: func(n network.Network, c network.Conn) {
-			//fmt.Printf("Nova conexão estabelecida: %s via %s\n", c.RemotePeer(), c.RemoteMultiaddr())
+			pid := c.RemotePeer()
+			node.SetConnected(pid, true)
+			// Opcional: logar conexões novas
+			// fmt.Printf("Nova conexão: %s via %s\n", pid, c.RemoteMultiaddr())
 		},
 	})
 
-	go discoverPeers(ctx, h)
+	// Inicia descoberta de peers em goroutine separada
+	go node.DiscoverPeers()
 
+	// Inicializa pubsub
 	ps, err := pubsub.NewGossipSub(
-		ctx,
-		h,
-		pubsub.WithFloodPublish(true), // dissemina rápido em redes pequenas
+		node.ctx,
+		host,
+		pubsub.WithFloodPublish(true),
 		pubsub.WithMessageSigning(true),
-		pubsub.WithPeerExchange(true), // Habilita troca de peers
+		pubsub.WithPeerExchange(true),
 		pubsub.WithStrictSignatureVerification(true),
 		pubsub.WithValidateQueueSize(128),
 		pubsub.WithValidateThrottle(2048),
 		pubsub.WithSubscriptionFilter(
 			pubsub.WrapLimitSubscriptionFilter(
-				pubsub.NewAllowlistSubscriptionFilter([]string{*topicNameFlag}...),
+				pubsub.NewAllowlistSubscriptionFilter([]string{node.topicName}...),
 				100,
 			),
 		),
 	)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("falha ao criar pubsub: %w", err)
 	}
-	topic, err := ps.Join(*topicNameFlag)
-	if err != nil {
-		panic(err)
-	}
-	go streamConsoleTo(ctx, topic)
+	node.pubsub = ps
 
-	sub, err := topic.Subscribe()
+	// Participa do tópico
+	topic, err := ps.Join(node.topicName)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("falha ao participar do tópico: %w", err)
 	}
-	printMessagesFrom(ctx, sub)
+	node.topic = topic
+
+	return nil
+}
+
+// GetTopic retorna o tópico atual
+func (node *P2PNode) GetTopic() *pubsub.Topic {
+	return node.topic
+}
+
+// Subscribe inscreve-se no tópico atual
+func (node *P2PNode) Subscribe() (*pubsub.Subscription, error) {
+	if node.topic == nil {
+		return nil, fmt.Errorf("nenhum tópico disponível para inscrição")
+	}
+	return node.topic.Subscribe()
+}
+
+// PublishMessage publica uma mensagem no tópico
+func (node *P2PNode) PublishMessage(data []byte) error {
+	if node.topic == nil {
+		return fmt.Errorf("nenhum tópico disponível para publicação")
+	}
+	return node.topic.Publish(node.ctx, data)
+}
+
+// Stop para todas as operações do nó de forma ordenada
+func (node *P2PNode) Stop() {
+	fmt.Println("Iniciando encerramento do nó P2P...")
+
+	// Primeiro salvamos os peers conhecidos
+	if node.host != nil {
+		fmt.Println("Salvando lista de peers...")
+		node.saveKnownPeers()
+	}
+
+	// Cancelamos o contexto para sinalizar para todas as goroutines pararem
+	if node.cancel != nil {
+		fmt.Println("Cancelando contexto...")
+		node.cancel()
+	}
+
+	// Fechamos componentes na ordem inversa de criação
+	if node.topic != nil {
+		fmt.Println("Fechando tópico...")
+		// Nota: topic.Close() não existe na API atual, mas seria ideal chamá-lo se existisse
+	}
+
+	if node.pubsub != nil {
+		fmt.Println("Fechando sistema de publicação/assinatura...")
+		// Mesma observação sobre pubsub.Close()
+	}
+
+	if node.dht != nil {
+		fmt.Println("Fechando DHT...")
+		err := node.dht.Close()
+		if err != nil {
+			fmt.Printf("Erro ao fechar DHT: %s\n", err)
+		}
+	}
+
+	if node.host != nil {
+		fmt.Println("Fechando host libp2p...")
+		err := node.host.Close()
+		if err != nil {
+			fmt.Printf("Erro ao fechar host: %s\n", err)
+		}
+	}
+
+	fmt.Println("Nó P2P encerrado com sucesso")
+}
+
+func main() {
+	log.SetAllLoggers(log.LevelError)
+	flag.Parse()
+
+	topicNameFlag := flag.String("topic", "p2pchat", "Nome do tópico para comunicação P2P")
+
+	// Cria nova instância do componente P2P
+	p2pNode := NewP2PNode(*topicNameFlag, KeyFile, PeersFile)
+
+	// Inicia o nó
+	err := p2pNode.Start()
+	if err != nil {
+		panic(fmt.Sprintf("Falha ao iniciar nó P2P: %s", err))
+	}
+
+	// Configura captura de sinais para encerramento limpo
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+
+	// WaitGroup para aguardar o término de todas as goroutines
+	var wg sync.WaitGroup
+
+	// Inicia rotina para processar sinais
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sig := <-signalChan
+		fmt.Printf("\nSinal recebido: %v, iniciando encerramento controlado...\n", sig)
+
+		// Desregistra o handler para evitar múltiplos sinais
+		signal.Stop(signalChan)
+
+		// Inicia processo de encerramento do nó
+		p2pNode.Stop()
+	}()
+
+	// Inicia rotina de leitura do console com controle de encerramento
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		reader := bufio.NewReader(os.Stdin)
+		for {
+			select {
+			case <-p2pNode.ctx.Done():
+				fmt.Println("Encerrando rotina de leitura do console...")
+				return
+			default:
+				s, err := reader.ReadString('\n')
+				if err != nil {
+					if err == io.EOF || strings.Contains(err.Error(), "closed") {
+						return
+					}
+					fmt.Printf("Erro na leitura do console: %s\n", err)
+					continue
+				}
+
+				// Publica a mensagem
+				err = p2pNode.PublishMessage([]byte(s))
+				if err != nil {
+					fmt.Printf("Erro ao publicar mensagem: %s\n", err)
+				}
+			}
+		}
+	}()
+
+	// Inscreve-se no tópico para receber mensagens
+	sub, err := p2pNode.Subscribe()
+	if err != nil {
+		fmt.Printf("Falha ao inscrever-se no tópico: %s\n", err)
+		p2pNode.Stop()
+		os.Exit(1)
+	}
+
+	// Processa mensagens recebidas até cancelamento
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-p2pNode.ctx.Done():
+				fmt.Println("Encerrando processamento de mensagens...")
+				return
+			default:
+				m, err := sub.Next(p2pNode.ctx)
+				if err != nil {
+					if err == context.Canceled {
+						return
+					}
+					fmt.Printf("Erro ao receber mensagem: %s\n", err)
+					continue
+				}
+				fmt.Printf("%s: %s", m.ReceivedFrom, string(m.Message.Data))
+			}
+		}
+	}()
+
+	// Aguarda todas as goroutines terminarem
+	wg.Wait()
+	fmt.Println("Programa encerrado com sucesso")
 }
