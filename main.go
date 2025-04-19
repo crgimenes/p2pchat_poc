@@ -19,6 +19,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns" // Adicionar importação para mDNS
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
@@ -45,6 +46,7 @@ const (
 	maxReconnectAttempts = 10
 	initialBackoff       = 1 * time.Second
 	maxBackoff           = 60 * time.Second
+	mdnsServiceTag       = "p2pchat-poc" // Tag para o serviço mDNS
 )
 
 var (
@@ -469,6 +471,42 @@ func discoverPeers(ctx context.Context, h host.Host) {
 	}
 }
 
+// Implementa interface de notificação de descoberta para mDNS
+type mdnsNotifee struct {
+	h host.Host
+}
+
+// Interface HandlePeerFound é chamada quando mDNS descobre um novo peer
+func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if pi.ID == n.h.ID() {
+		return // Ignora auto-descoberta
+	}
+
+	fmt.Printf("Peer encontrado via mDNS: %s\n", pi.ID)
+
+	// Tenta se conectar ao peer descoberto
+	err := n.h.Connect(context.Background(), pi)
+	if err != nil {
+		fmt.Printf("Falha ao conectar via mDNS com %s: %s\n", pi.ID, err)
+		return
+	}
+
+	fmt.Printf("Conectado via mDNS com %s\n", pi.ID)
+	connected[pi.ID] = true
+}
+
+// Inicia serviço de descoberta mDNS
+func setupMDNS(h host.Host) error {
+	// Configurar serviço mDNS para descoberta local
+	service := mdns.NewMdnsService(h, mdnsServiceTag, &mdnsNotifee{h: h})
+	if service == nil {
+		return fmt.Errorf("falha ao criar serviço mDNS")
+	}
+
+	fmt.Println("Serviço de descoberta local mDNS iniciado")
+	return nil
+}
+
 func streamConsoleTo(ctx context.Context, topic *pubsub.Topic) {
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -552,6 +590,12 @@ func main() {
 		} else {
 			fmt.Println("Serviço de hole punch iniciado com sucesso")
 		}
+	}
+
+	// Iniciar o serviço de descoberta local mDNS
+	err = setupMDNS(h)
+	if err != nil {
+		fmt.Printf("Falha ao iniciar serviço mDNS: %s\n", err)
 	}
 
 	// Exibe informação do host
