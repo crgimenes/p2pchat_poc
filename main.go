@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
 	log "github.com/ipfs/go-log/v2"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -30,8 +29,11 @@ type KnownPeers struct {
 }
 
 const (
-	KeyFile   = "node.key"
-	PeersFile = "known_peers.json"
+	KeyFile              = "node.key"
+	PeersFile            = "known_peers.json"
+	maxReconnectAttempts = 10
+	initialBackoff       = 1 * time.Second
+	maxBackoff           = 60 * time.Second
 )
 
 var (
@@ -152,7 +154,8 @@ func initDHT(ctx context.Context, h host.Host) *dht.IpfsDHT {
 	if err != nil {
 		panic(err)
 	}
-	if err = kademliaDHT.Bootstrap(ctx); err != nil {
+	err = kademliaDHT.Bootstrap(ctx)
+	if err != nil {
 		panic(err)
 	}
 	var wg sync.WaitGroup
@@ -161,7 +164,8 @@ func initDHT(ctx context.Context, h host.Host) *dht.IpfsDHT {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := h.Connect(ctx, *peerinfo); err != nil {
+			err := h.Connect(ctx, *peerinfo)
+			if err != nil {
 				fmt.Println("Bootstrap warning:", err)
 			}
 		}()
@@ -172,6 +176,11 @@ func initDHT(ctx context.Context, h host.Host) *dht.IpfsDHT {
 }
 
 func discoverPeers(ctx context.Context, h host.Host) {
+	// Armazena tentativas de reconexão por peer
+	reconnectAttempts := make(map[peer.ID]int)
+	lastAttempt := make(map[peer.ID]time.Time)
+
+	// Salvamento periódico dos peers conhecidos
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
@@ -186,66 +195,150 @@ func discoverPeers(ctx context.Context, h host.Host) {
 		}
 	}()
 
-	b := backoff.NewExponentialBackOff()
 	kademliaDHT := initDHT(ctx, h)
 	routingDiscovery := drouting.NewRoutingDiscovery(kademliaDHT)
+
 	for {
 		dutil.Advertise(ctx, routingDiscovery, *topicNameFlag)
 
-		// Reconnect to known peers
+		// Tenta reconectar aos peers conhecidos
 		knownPeers := loadKnownPeers()
-		for _, peer := range knownPeers {
-			if peer.ID == h.ID() {
+		now := time.Now()
+
+		// Reconexão com peers conhecidos
+		for _, peerInfo := range knownPeers {
+			if peerInfo.ID == h.ID() {
 				continue
 			}
 
-			if _, ok := connected[peer.ID]; ok {
+			if _, ok := connected[peerInfo.ID]; ok {
+				continue // Já conectado
+			}
+
+			// Verifica se atingiu o limite de tentativas
+			if attempts, exists := reconnectAttempts[peerInfo.ID]; exists && attempts >= maxReconnectAttempts {
+				fmt.Printf("Desistindo de reconexão com %s após %d tentativas\n", peerInfo.ID, attempts)
+				ignore[peerInfo.ID] = true
 				continue
 			}
 
-			err := h.Connect(ctx, peer)
+			// Aplica backoff exponencial
+			if lastTime, exists := lastAttempt[peerInfo.ID]; exists {
+				attempts := reconnectAttempts[peerInfo.ID]
+				backoffDuration := initialBackoff * time.Duration(1<<uint(attempts))
+				if backoffDuration > maxBackoff {
+					backoffDuration = maxBackoff
+				}
+
+				if now.Sub(lastTime) < backoffDuration {
+					continue // Ainda não é hora de tentar novamente
+				}
+			}
+
+			// Tenta reconectar
+			err := h.Connect(ctx, peerInfo)
 			if err == nil {
-				fmt.Printf("Reconectado a peer conhecido: %s\n", peer.ID)
-				connected[peer.ID] = true
+				fmt.Printf("Reconectado com sucesso ao peer conhecido: %s\n", peerInfo.ID)
+				connected[peerInfo.ID] = true
+				delete(reconnectAttempts, peerInfo.ID)
+				delete(ignore, peerInfo.ID)
+				delete(lastAttempt, peerInfo.ID)
+			} else {
+				fmt.Printf("Falha na reconexão com %s: %s\n", peerInfo.ID, err)
+				reconnectAttempts[peerInfo.ID]++
+				lastAttempt[peerInfo.ID] = now
 			}
 		}
 
+		// Tentar reconectar peers ignorados anteriormente
+		for peerID := range ignore {
+			if _, ok := connected[peerID]; ok {
+				continue // Já está conectado
+			}
+
+			// Verifica se atingiu o limite de tentativas
+			if attempts, exists := reconnectAttempts[peerID]; exists && attempts >= maxReconnectAttempts {
+				continue // Desistir permanentemente após muitas tentativas
+			}
+
+			// Aplica backoff exponencial
+			if lastTime, exists := lastAttempt[peerID]; exists {
+				attempts := reconnectAttempts[peerID]
+				backoffDuration := initialBackoff * time.Duration(1<<uint(attempts))
+				if backoffDuration > maxBackoff {
+					backoffDuration = maxBackoff
+				}
+
+				if now.Sub(lastTime) < backoffDuration {
+					continue // Ainda não é hora de tentar novamente
+				}
+			}
+
+			// Tenta encontrar o peer diretamente usando o DHT
+			// Corrigindo problema: RoutingDiscovery não tem método FindPeer
+			peerInfo, err := kademliaDHT.FindPeer(ctx, peerID)
+			if err != nil {
+				fmt.Printf("Não foi possível encontrar o peer %s: %s\n", peerID, err)
+				reconnectAttempts[peerID]++
+				lastAttempt[peerID] = now
+				continue
+			}
+
+			err = h.Connect(ctx, peerInfo)
+			if err == nil {
+				fmt.Printf("Reconexão bem-sucedida com peer anteriormente ignorado: %s\n", peerID)
+				connected[peerID] = true
+				delete(reconnectAttempts, peerID)
+				delete(ignore, peerID)
+				delete(lastAttempt, peerID)
+			} else {
+				fmt.Printf("Falha na reconexão com peer ignorado %s: %s\n", peerID, err)
+				reconnectAttempts[peerID]++
+				lastAttempt[peerID] = now
+			}
+		}
+
+		// Procura por novos peers
 		peerChan, err := routingDiscovery.FindPeers(ctx, *topicNameFlag)
 		if err != nil {
-			panic(err)
+			fmt.Printf("Erro na descoberta de peers: %s. Tentando novamente...\n", err)
+			time.Sleep(5 * time.Second)
+			continue
 		}
-		for peer := range peerChan {
-			if peer.ID == h.ID() {
-				continue // No self connection
+
+		// Processa novos peers encontrados
+		for peerInfo := range peerChan {
+			if peerInfo.ID == h.ID() {
+				continue // Evitar auto-conexão
 			}
 
-			if _, ok := ignore[peer.ID]; ok {
-				continue // Ignore this peer
+			if _, ok := connected[peerInfo.ID]; ok {
+				continue // Já conectado
 			}
 
-			if _, ok := connected[peer.ID]; ok {
-				continue // Already connected
+			if _, ok := ignore[peerInfo.ID]; ok {
+				continue // Ignorado anteriormente
 			}
 
-			err := h.Connect(ctx, peer)
+			err := h.Connect(ctx, peerInfo)
 			if err != nil {
-				if err.Error() == "no addresses" { // TODO: Handle this by compare ErrNoAddresses
-					ignore[peer.ID] = true
+				if err.Error() == "no addresses" {
+					ignore[peerInfo.ID] = true
 					continue
 				}
 
-				fmt.Println("Failed connecting to", peer.ID, ", error:", err)
-
-				// ignore peers that we can't connect to
-				ignore[peer.ID] = true
+				fmt.Printf("Falha ao conectar com %s: %s\n", peerInfo.ID, err)
+				reconnectAttempts[peerInfo.ID] = 1
+				lastAttempt[peerInfo.ID] = now
 				continue
 			}
-			fmt.Println("Connected to:", peer.ID)
 
-			// add peer to connected list
-			connected[peer.ID] = true
+			fmt.Printf("Conectado com sucesso a novo peer: %s\n", peerInfo.ID)
+			connected[peerInfo.ID] = true
 		}
-		time.Sleep(b.NextBackOff())
+
+		// Aguarda antes da próxima iteração
+		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -256,7 +349,8 @@ func streamConsoleTo(ctx context.Context, topic *pubsub.Topic) {
 		if err != nil {
 			panic(err)
 		}
-		if err := topic.Publish(ctx, []byte(s)); err != nil {
+		err = topic.Publish(ctx, []byte(s))
+		if err != nil {
 			fmt.Println("### Publish error:", err)
 		}
 	}

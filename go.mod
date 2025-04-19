@@ -3,11 +3,11 @@ module e1
 go 1.24.2
 
 require (
-	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/ipfs/go-log/v2 v2.5.1
 	github.com/libp2p/go-libp2p v0.41.1
 	github.com/libp2p/go-libp2p-kad-dht v0.31.0
 	github.com/libp2p/go-libp2p-pubsub v0.13.1
+	github.com/multiformats/go-multiaddr v0.15.0
 )
 
 require (
@@ -64,7 +64,6 @@ require (
 	github.com/mr-tron/base58 v1.2.0 // indirect
 	github.com/multiformats/go-base32 v0.1.0 // indirect
 	github.com/multiformats/go-base36 v0.2.0 // indirect
-	github.com/multiformats/go-multiaddr v0.15.0 // indirect
 	github.com/multiformats/go-multiaddr-dns v0.4.1 // indirect
 	github.com/multiformats/go-multiaddr-fmt v0.1.0 // indirect
 	github.com/multiformats/go-multibase v0.2.0 // indirect
