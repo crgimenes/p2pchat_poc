@@ -15,6 +15,7 @@ import (
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
@@ -142,9 +143,23 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	h.Network().Notify(&network.NotifyBundle{
+		DisconnectedF: func(n network.Network, c network.Conn) {
+			pid := c.RemotePeer()
+			// schedule reconnect
+			go func() { h.Connect(ctx, peer.AddrInfo{ID: pid}) }()
+		},
+	})
+
 	go discoverPeers(ctx, h)
 
-	ps, err := pubsub.NewGossipSub(ctx, h)
+	ps, err := pubsub.NewGossipSub(
+		ctx,
+		h,
+		pubsub.WithStrictSignatureVerification(true),
+		pubsub.WithMessageSigning(true),
+		pubsub.WithFloodPublish(true), // dissemina rápido em redes pequenas
+	)
 	if err != nil {
 		panic(err)
 	}
