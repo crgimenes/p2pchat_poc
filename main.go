@@ -384,9 +384,7 @@ func isLocalAddress(addr ma.Multiaddr) bool {
 // Calcula o próximo tempo de espera para backoff exponencial
 func nextBackoff(attempt int) time.Duration {
 	backoffDuration := initialBackoff * time.Duration(1<<uint(attempt))
-	if backoffDuration > maxBackoff {
-		backoffDuration = maxBackoff
-	}
+	backoffDuration = max(backoffDuration, maxBackoff)
 	return backoffDuration
 }
 
