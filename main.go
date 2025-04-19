@@ -133,7 +133,8 @@ func main() {
 
 	ctx := context.Background()
 
-	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
+	h, err := libp2p.New(
+		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
 		libp2p.NATPortMap(),  // enable UPnP/PCP port mapping
 		libp2p.EnableRelay(), // allow this node to be a relay hop
 		//libp2p.EnableAutoRelay(),      // discover and use relays automatically  Deprecated: Use EnableAutoRelayWithStaticRelays or EnableAutoRelayWithPeerSource
