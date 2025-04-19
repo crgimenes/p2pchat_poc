@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"sort"
+
 	log "github.com/ipfs/go-log/v2"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -202,6 +204,13 @@ func saveKnownPeers(h host.Host) {
 		}
 	}
 
+	// Limita o número de peers armazenados para 30, mantendo os melhores
+	const maxPeers = 30
+	if len(knownPeers.Peers) > maxPeers {
+		knownPeers.Peers = selectBestPeers(knownPeers.Peers, maxPeers)
+		changed = true
+	}
+
 	// Salva apenas se houve mudanças
 	if changed {
 		knownPeers.LastModified = now
@@ -218,6 +227,51 @@ func saveKnownPeers(h host.Host) {
 			lastSavedPeers = knownPeers
 		}
 	}
+}
+
+// Seleciona os melhores peers com base em critérios de qualidade
+func selectBestPeers(peers map[string]KnownPeer, limit int) map[string]KnownPeer {
+	// Criar uma estrutura para classificação
+	type PeerRanking struct {
+		ID    string
+		Peer  KnownPeer
+		Score float64
+	}
+
+	// Calcular pontuação para cada peer
+	var rankings []PeerRanking
+	now := time.Now()
+
+	for id, peer := range peers {
+		// Pontuação baseada em:
+		// 1. Número de conexões bem-sucedidas (maior é melhor)
+		// 2. Quão recentemente o peer foi visto (mais recente é melhor)
+
+		recencyScore := 1.0 / (now.Sub(peer.LastSeen).Hours() + 1.0) // Evita divisão por zero
+		connectionsScore := float64(peer.SuccessfulConnections)
+
+		// Combinação ponderada dos critérios (podemos ajustar os pesos)
+		score := (recencyScore * 10.0) + connectionsScore
+
+		rankings = append(rankings, PeerRanking{
+			ID:    id,
+			Peer:  peer,
+			Score: score,
+		})
+	}
+
+	// Ordena os peers por pontuação (maior para menor)
+	sort.Slice(rankings, func(i, j int) bool {
+		return rankings[i].Score > rankings[j].Score
+	})
+
+	// Seleciona apenas os top 'limit' peers
+	result := make(map[string]KnownPeer)
+	for i := 0; i < limit && i < len(rankings); i++ {
+		result[rankings[i].ID] = rankings[i].Peer
+	}
+
+	return result
 }
 
 // Função auxiliar para determinar se um endereço é local
@@ -394,9 +448,7 @@ func discoverPeers(ctx context.Context, h host.Host) {
 			if lastTime, exists := lastAttempt[peerID]; exists {
 				attempts := reconnectAttempts[peerID]
 				backoffDuration := initialBackoff * time.Duration(1<<uint(attempts))
-				if backoffDuration > maxBackoff {
-					backoffDuration = maxBackoff
-				}
+				backoffDuration = max(backoffDuration, maxBackoff)
 
 				if now.Sub(lastTime) < backoffDuration {
 					continue // Ainda não é hora de tentar novamente
