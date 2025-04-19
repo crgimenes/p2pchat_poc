@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,9 +24,16 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-// Estrutura para armazenar peers conhecidos
+// Estrutura para armazenar peers conhecidos com timestamp
+type KnownPeer struct {
+	Addr                  string    `json:"addr"`
+	LastSeen              time.Time `json:"last_seen"`
+	SuccessfulConnections int       `json:"successful_connections"`
+}
+
 type KnownPeers struct {
-	Peers []string `json:"peers"`
+	Peers        map[string]KnownPeer `json:"peers"` // Chave é o peer ID
+	LastModified time.Time            `json:"last_modified"`
 }
 
 const (
@@ -37,29 +45,53 @@ const (
 )
 
 var (
-	topicNameFlag = flag.String("topicName", "applesauce_crg_y", "name of topic to join")
-	connected     = make(map[peer.ID]bool)
-	ignore        = make(map[peer.ID]bool)
+	topicNameFlag   = flag.String("topicName", "applesauce_crg_y", "name of topic to join")
+	connected       = make(map[peer.ID]bool)
+	ignore          = make(map[peer.ID]bool)
+	knownPeersMutex sync.RWMutex
+	lastSavedPeers  KnownPeers
 )
 
 // Carregar peers conhecidos do disco
 func loadKnownPeers() []peer.AddrInfo {
+	knownPeersMutex.RLock()
+	defer knownPeersMutex.RUnlock()
+
 	var knownPeers KnownPeers
 
 	data, err := os.ReadFile(PeersFile)
 	if err != nil {
+		// Inicializa uma estrutura vazia se o arquivo não existir
+		knownPeers = KnownPeers{
+			Peers:        make(map[string]KnownPeer),
+			LastModified: time.Now(),
+		}
+		lastSavedPeers = knownPeers
 		return nil
 	}
 
 	err = json.Unmarshal(data, &knownPeers)
 	if err != nil {
 		fmt.Printf("Erro ao desserializar peers conhecidos: %s\n", err)
-		return nil
+		knownPeers = KnownPeers{
+			Peers:        make(map[string]KnownPeer),
+			LastModified: time.Now(),
+		}
+	}
+
+	lastSavedPeers = knownPeers
+
+	// Filtrar peers antigos (mais de 7 dias sem conexão)
+	now := time.Now()
+	for id, peer := range knownPeers.Peers {
+		if now.Sub(peer.LastSeen) > 7*24*time.Hour && peer.SuccessfulConnections < 3 {
+			delete(knownPeers.Peers, id)
+		}
 	}
 
 	var peers []peer.AddrInfo
-	for _, addrStr := range knownPeers.Peers {
-		addr, err := ma.NewMultiaddr(addrStr)
+	for _, knownPeer := range knownPeers.Peers {
+		addr, err := ma.NewMultiaddr(knownPeer.Addr)
 		if err != nil {
 			continue
 		}
@@ -77,29 +109,93 @@ func loadKnownPeers() []peer.AddrInfo {
 
 // Salvar peers conhecidos no disco
 func saveKnownPeers(h host.Host) {
-	var knownPeers KnownPeers
+	knownPeersMutex.Lock()
+	defer knownPeersMutex.Unlock()
 
+	// Carregue a estrutura atual se ainda não inicializada
+	var knownPeers KnownPeers
+	if lastSavedPeers.Peers == nil {
+		knownPeers = KnownPeers{
+			Peers:        make(map[string]KnownPeer),
+			LastModified: time.Now(),
+		}
+	} else {
+		knownPeers = lastSavedPeers
+	}
+
+	changed := false
+	now := time.Now()
+
+	// Atualiza peers conectados
 	for peerID := range connected {
 		peer := h.Peerstore().PeerInfo(peerID)
+
+		// Escolhe o melhor endereço para este peer
+		// Prefere endereços não-locais para maior estabilidade
+		var bestAddr ma.Multiaddr
 		for _, addr := range peer.Addrs {
-			fullAddr := addr.String() + "/p2p/" + peer.ID.String()
-			knownPeers.Peers = append(knownPeers.Peers, fullAddr)
+			if bestAddr == nil {
+				bestAddr = addr
+				continue
+			}
+
+			// Prioriza endereços não locais
+			if !isLocalAddress(bestAddr) && isLocalAddress(addr) {
+				continue
+			}
+
+			// Você pode adicionar mais lógica de seleção aqui
+			bestAddr = addr
+		}
+
+		if bestAddr != nil {
+			fullAddr := bestAddr.String() + "/p2p/" + peer.ID.String()
+			peerID := peer.ID.String()
+
+			existingPeer, exists := knownPeers.Peers[peerID]
+			if exists {
+				existingPeer.LastSeen = now
+				existingPeer.SuccessfulConnections++
+				knownPeers.Peers[peerID] = existingPeer
+				changed = true
+			} else {
+				knownPeers.Peers[peerID] = KnownPeer{
+					Addr:                  fullAddr,
+					LastSeen:              now,
+					SuccessfulConnections: 1,
+				}
+				changed = true
+			}
 		}
 	}
 
-	data, err := json.MarshalIndent(knownPeers, "", "  ")
-	if err != nil {
-		fmt.Printf("Erro ao serializar peers conhecidos: %s\n", err)
-		return
-	}
+	// Salva apenas se houve mudanças
+	if changed {
+		knownPeers.LastModified = now
+		data, err := json.Marshal(knownPeers)
+		if err != nil {
+			fmt.Printf("Erro ao serializar peers conhecidos: %s\n", err)
+			return
+		}
 
-	err = os.WriteFile(PeersFile, data, 0644)
-	if err != nil {
-		fmt.Printf("Erro ao salvar peers conhecidos: %s\n", err)
+		err = os.WriteFile(PeersFile, data, 0644)
+		if err != nil {
+			fmt.Printf("Erro ao salvar peers conhecidos: %s\n", err)
+		} else {
+			lastSavedPeers = knownPeers
+		}
 	}
 }
 
-// Adicione estas funções
+// Função auxiliar para determinar se um endereço é local
+func isLocalAddress(addr ma.Multiaddr) bool {
+	// Implementação simplificada - você pode expandir conforme necessário
+	return strings.Contains(addr.String(), "/ip4/127.0.0.1/") ||
+		strings.Contains(addr.String(), "/ip4/192.168.") ||
+		strings.Contains(addr.String(), "/ip4/10.") ||
+		strings.Contains(addr.String(), "/ip4/172.16.")
+}
+
 func loadOrCreateIdentity() crypto.PrivKey {
 	if _, err := os.Stat(KeyFile); os.IsNotExist(err) {
 		fmt.Println("Arquivo de chaves não encontrado. Gerando novas chaves...")
