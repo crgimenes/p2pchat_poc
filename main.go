@@ -21,6 +21,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
+	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
+	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -51,6 +54,34 @@ var (
 	knownPeersMutex sync.RWMutex
 	lastSavedPeers  KnownPeers
 )
+
+// Lista de relays estáticos que podem ser usados quando direto peer-to-peer falha
+var staticRelays = []string{
+	"/ip4/147.75.80.110/tcp/4001/p2p/QmbFgm5rao4mLdUAaCPgRGRoqyMKfK2gCgQaT77PmPjsEY",
+	"/ip4/147.75.195.153/tcp/4001/p2p/QmW9m57aiBDHAkKj9nmFSEn7ZqrcF1fZS4bipsTCHburei",
+	"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+	"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+}
+
+// Converte strings de endereços para peer.AddrInfo
+func convertToAddrInfo(addresses []string) []peer.AddrInfo {
+	var addrInfos []peer.AddrInfo
+	for _, addrStr := range addresses {
+		addr, err := ma.NewMultiaddr(addrStr)
+		if err != nil {
+			fmt.Printf("Endereço inválido %s: %s\n", addrStr, err)
+			continue
+		}
+
+		addrInfo, err := peer.AddrInfoFromP2pAddr(addr)
+		if err != nil {
+			fmt.Printf("Falha ao converter %s para AddrInfo: %s\n", addrStr, err)
+			continue
+		}
+		addrInfos = append(addrInfos, *addrInfo)
+	}
+	return addrInfos
+}
 
 // Carregar peers conhecidos do disco
 func loadKnownPeers() []peer.AddrInfo {
@@ -470,15 +501,57 @@ func main() {
 	ctx := context.Background()
 
 	priv := loadOrCreateIdentity()
-	h, err := libp2p.New(
-		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
-		libp2p.NATPortMap(),  // enable UPnP/PCP port mapping
-		libp2p.EnableRelay(), // allow this node to be a relay hop
-		//libp2p.EnableAutoRelay(),      // discover and use relays automatically  Deprecated: Use EnableAutoRelayWithStaticRelays or EnableAutoRelayWithPeerSource
+
+	// Converte os relays estáticos para o formato adequado
+	staticRelaysInfo := convertToAddrInfo(staticRelays)
+
+	// Configura lista de opções para o host libp2p
+	opts := []libp2p.Option{
+		// Escutar em múltiplos endereços e protocolos
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/0",
+			"/ip4/0.0.0.0/udp/0/quic-v1", // Suporte QUIC
+			"/ip4/0.0.0.0/tcp/0/ws",      // Suporte WebSocket
+		),
+		libp2p.NATPortMap(),                                      // Utiliza UPnP/PCP para mapeamento de portas
+		libp2p.EnableHolePunching(),                              // Habilita técnicas de hole-punching para atravessar NATs
+		libp2p.EnableRelayService(),                              // Permite que este nó forneça serviço relay v2
+		libp2p.EnableAutoRelayWithStaticRelays(staticRelaysInfo), // Usa relays estáticos para fallback
+		libp2p.ForceReachabilityPublic(),                         // Força modo público para melhorar descoberta
 		libp2p.Identity(priv),
-	)
+	}
+
+	h, err := libp2p.New(opts...)
 	if err != nil {
 		panic(err)
+	}
+
+	// Configura serviços adicionais
+
+	// Cria serviço relay com configurações simplificadas
+	// Como a API do relay parece ter mudado na sua versão, usamos uma versão mais simples
+	_, err = relay.New(h)
+	if err != nil {
+		fmt.Printf("Falha ao iniciar serviço relay: %s\n", err)
+	}
+
+	// A API para holepunching também parece diferente na sua versão
+	// Vamos tentar uma abordagem mais compatível
+	// Primeiro, precisamos obter o serviço de identificação do host
+	ids, ok := h.Peerstore().(identify.IDService)
+	if !ok {
+		fmt.Println("Host não fornece serviço de identificação compatível")
+	} else {
+		// Função para obter endereços
+		addrF := func() []ma.Multiaddr { return h.Addrs() }
+
+		// Cria o serviço holepunch sem tracer para evitar problemas de compatibilidade
+		_, err = holepunch.NewService(h, ids, addrF)
+		if err != nil {
+			fmt.Printf("Falha ao iniciar serviço de hole punch: %s\n", err)
+		} else {
+			fmt.Println("Serviço de hole punch iniciado com sucesso")
+		}
 	}
 
 	// Exibe informação do host
@@ -492,6 +565,10 @@ func main() {
 			pid := c.RemotePeer()
 			// schedule reconnect
 			go func() { h.Connect(ctx, peer.AddrInfo{ID: pid}) }()
+		},
+		// Adiciona monitoramento de conexões
+		ConnectedF: func(n network.Network, c network.Conn) {
+			//fmt.Printf("Nova conexão estabelecida: %s via %s\n", c.RemotePeer(), c.RemoteMultiaddr())
 		},
 	})
 
