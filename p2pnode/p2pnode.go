@@ -2,6 +2,7 @@ package p2pnode
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -24,6 +25,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -400,6 +402,35 @@ func (node *Node) loadOrCreateIdentity() crypto.PrivKey {
 		return priv
 	}
 
+	// Verifica se é um formato armored
+	keyStr := string(keyBytes)
+
+	// Se conter os marcadores de início e fim do formato armored
+	if strings.Contains(keyStr, "-----BEGIN") && strings.Contains(keyStr, "-----END") {
+		// Remove cabeçalhos e rodapés e espaços em branco
+		keyStr = strings.ReplaceAll(keyStr, "-----BEGIN ED25519 PRIVATE KEY-----", "")
+		keyStr = strings.ReplaceAll(keyStr, "-----END ED25519 PRIVATE KEY-----", "")
+		keyStr = strings.TrimSpace(keyStr)
+
+		// Remove todas as quebras de linha
+		keyStr = strings.ReplaceAll(keyStr, "\n", "")
+
+		// Decodifica base64
+		decoded, err := base64.StdEncoding.DecodeString(keyStr)
+		if err != nil {
+			fmt.Printf("Erro ao decodificar chave armored: %s. Gerando novas chaves...\n", err)
+			priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+			if err != nil {
+				panic(err)
+			}
+			node.saveKeyToFile(priv)
+			return priv
+		}
+
+		// Usa os bytes decodificados
+		keyBytes = decoded
+	}
+
 	priv, err := crypto.UnmarshalPrivateKey(keyBytes)
 	if err != nil {
 		fmt.Printf("Erro ao carregar chaves: %s. Gerando novas chaves...\n", err)
@@ -415,13 +446,31 @@ func (node *Node) loadOrCreateIdentity() crypto.PrivKey {
 	return priv
 }
 
-// saveKeyToFile salva a chave privada em um arquivo
+// saveKeyToFile salva a chave privada em um arquivo em formato armored
 func (node *Node) saveKeyToFile(priv crypto.PrivKey) error {
 	keyBytes, err := crypto.MarshalPrivateKey(priv)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(node.keyFile, keyBytes, 0600)
+
+	// Codificar em base64 para criar formato armored
+	encoded := base64.StdEncoding.EncodeToString(keyBytes)
+
+	// Adicionar cabeçalho e rodapé ao estilo OpenSSH
+	armoredKey := "-----BEGIN ED25519 PRIVATE KEY-----\n"
+
+	// Dividir em linhas de 64 caracteres
+	for i := 0; i < len(encoded); i += 64 {
+		end := i + 64
+		if end > len(encoded) {
+			end = len(encoded)
+		}
+		armoredKey += encoded[i:end] + "\n"
+	}
+
+	armoredKey += "-----END ED25519 PRIVATE KEY-----\n"
+
+	return os.WriteFile(node.keyFile, []byte(armoredKey), 0600)
 }
 
 // initDHT inicializa a tabela hash distribuída do nó
@@ -841,4 +890,32 @@ func SetLogLevel(level string) {
 	if level != "" {
 		log.SetLogLevel("p2p", level)
 	}
+}
+
+// OnlinePeers devolve só quem está inscrito, conectado e responde ao ping.
+func (n *Node) OnlinePeers(ctx context.Context) ([]peer.ID, error) {
+	// 1. inscritos no mesmo tópico
+	ids := n.pubsub.ListPeers(n.topicName)
+
+	// inicia serviço ping (uma vez na inicialização do nó)
+	ps := ping.NewPingService(n.host)
+
+	var ready []peer.ID
+	for _, pid := range ids {
+		if !n.isConnected(pid) { // 2. conexão ativa
+			continue
+		}
+		// 3. ping rápido de 3 s para confirmar liveness
+		ctxPing, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		select {
+		case res := <-ps.Ping(ctxPing, pid):
+			if res.Error == nil { // peer respondeu
+				ready = append(ready, pid)
+			}
+		case <-ctxPing.Done():
+			// timeout ‑ descarta
+		}
+	}
+	return ready, nil
 }
