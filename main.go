@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,6 +20,7 @@ const (
 	TopicName = "p2pchat"
 	KeyFile   = "node.key"
 	PeersFile = "known_peers.json"
+	LogFile   = "p2pchat.log"
 )
 
 func main() {
@@ -27,7 +29,14 @@ func main() {
 
 	// Crie e inicie o nó P2P
 	node := p2pnode.NewNode(TopicName, KeyFile, PeersFile)
-	err := node.Start()
+
+	// Inicializa o arquivo de log
+	err := node.InitLogFile(LogFile)
+	if err != nil {
+		fmt.Printf("Aviso: não foi possível inicializar o arquivo de log: %s\n", err)
+	}
+
+	err = node.Start()
 	if err != nil {
 		panic(fmt.Sprintf("Falha ao iniciar nó P2P: %s", err))
 	}
@@ -46,6 +55,7 @@ func main() {
 		fmt.Printf("\nSinal recebido: %v, iniciando encerramento controlado...\n", sig)
 
 		signal.Stop(signalChan)
+		node.CloseLogFile() // Fecha o arquivo de log
 		node.Stop()
 	}()
 
@@ -71,9 +81,25 @@ func main() {
 				}
 
 				s = strings.TrimSpace(s)
-				err = node.PublishMessage([]byte(s))
-				if err != nil {
-					fmt.Printf("Erro ao publicar mensagem: %s\n", err)
+
+				// Verifica se é um comando
+				if strings.HasPrefix(s, "!") {
+					// Processar como comando
+					result, err := node.ProcessCommand(s)
+					if err != nil {
+						fmt.Printf("Erro ao processar comando: %s\n", err)
+					} else if result != "" {
+						fmt.Println(result)
+					}
+				} else {
+					// Processar como mensagem normal
+					err = node.PublishMessage([]byte(s))
+					if err != nil {
+						fmt.Printf("Erro ao publicar mensagem: %s\n", err)
+						node.LogMessage("Erro ao publicar mensagem: %s", err)
+					} else {
+						node.LogMessage("Mensagem enviada: %s", s)
+					}
 				}
 			}
 		}
@@ -83,6 +109,7 @@ func main() {
 	sub, err := node.Subscribe()
 	if err != nil {
 		fmt.Printf("Falha ao inscrever-se no tópico: %s\n", err)
+		node.CloseLogFile()
 		node.Stop()
 		os.Exit(1)
 	}
@@ -104,12 +131,23 @@ func main() {
 						return
 					}
 					fmt.Printf("Erro ao receber mensagem: %s\n", err)
+					node.LogMessage("Erro ao receber mensagem: %s", err)
 					continue
 				}
-				fmt.Printf("%s: %s\n", m.ReceivedFrom, string(m.Data))
+
+				// Registra a mensagem recebida no log
+				message := string(m.Data)
+				node.LogMessage("Mensagem recebida de %s: %s", m.ReceivedFrom, message)
+
+				// Exibe a mensagem no console
+				fmt.Printf("%s: %s\n", m.ReceivedFrom, message)
 			}
 		}
 	}()
+
+	// Mensagem inicial após inicialização bem-sucedida
+	fmt.Println("P2P Chat iniciado. Para listar peers online, digite !op")
+	fmt.Println("Os logs do sistema estão sendo gravados em:", filepath.Join(filepath.Dir(LogFile), LogFile))
 
 	// Aguarde todas as goroutines terminarem
 	wg.Wait()

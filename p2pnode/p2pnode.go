@@ -75,6 +75,7 @@ type Node struct {
 	topic           *pubsub.Topic
 	topicName       string
 	staticRelays    []string
+	logFile         *os.File
 }
 
 // NewNode cria uma nova instância de um nó P2P
@@ -577,7 +578,7 @@ func (node *Node) discoverPeers() {
 			}
 
 			if attempts, exists := reconnectAttempts[peerInfo.ID]; exists && attempts >= maxReconnectAttempts {
-				fmt.Printf("Desistindo de reconexão com %s após %d tentativas\n", peerInfo.ID, attempts)
+				node.LogMessage("Desistindo de reconexão com %s após %d tentativas", peerInfo.ID, attempts)
 				node.setIgnored(peerInfo.ID, true)
 				continue
 			}
@@ -593,13 +594,13 @@ func (node *Node) discoverPeers() {
 
 			err := node.host.Connect(node.ctx, peerInfo)
 			if err == nil {
-				fmt.Printf("Reconectado com sucesso ao peer conhecido: %s\n", peerInfo.ID)
+				node.LogMessage("Reconectado com sucesso ao peer conhecido: %s", peerInfo.ID)
 				node.setConnected(peerInfo.ID, true)
 				delete(reconnectAttempts, peerInfo.ID)
 				node.setIgnored(peerInfo.ID, false)
 				delete(lastAttempt, peerInfo.ID)
 			} else {
-				fmt.Printf("Falha na reconexão com %s: %s\n", peerInfo.ID, err)
+				node.LogMessage("Falha na reconexão com %s: %s", peerInfo.ID, err)
 				reconnectAttempts[peerInfo.ID]++
 				lastAttempt[peerInfo.ID] = now
 			}
@@ -626,7 +627,7 @@ func (node *Node) discoverPeers() {
 
 			peerInfo, err := node.dht.FindPeer(node.ctx, peerID)
 			if err != nil {
-				fmt.Printf("Não foi possível encontrar o peer %s: %s\n", peerID, err)
+				node.LogMessage("Não foi possível encontrar o peer %s: %s", peerID, err)
 				reconnectAttempts[peerID]++
 				lastAttempt[peerID] = now
 				continue
@@ -634,13 +635,13 @@ func (node *Node) discoverPeers() {
 
 			err = node.host.Connect(node.ctx, peerInfo)
 			if err == nil {
-				fmt.Printf("Reconexão bem-sucedida com peer anteriormente ignorado: %s\n", peerID)
+				node.LogMessage("Reconexão bem-sucedida com peer anteriormente ignorado: %s", peerID)
 				node.setConnected(peerID, true)
 				delete(reconnectAttempts, peerID)
 				node.setIgnored(peerID, false)
 				delete(lastAttempt, peerID)
 			} else {
-				fmt.Printf("Falha na reconexão com peer ignorado %s: %s\n", peerID, err)
+				node.LogMessage("Falha na reconexão com peer ignorado %s: %s", peerID, err)
 				reconnectAttempts[peerID]++
 				lastAttempt[peerID] = now
 			}
@@ -648,7 +649,7 @@ func (node *Node) discoverPeers() {
 
 		peerChan, err := routingDiscovery.FindPeers(node.ctx, node.topicName)
 		if err != nil {
-			fmt.Printf("Erro na descoberta de peers: %s. Tentando novamente...\n", err)
+			node.LogMessage("Erro na descoberta de peers: %s. Tentando novamente...", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -673,13 +674,13 @@ func (node *Node) discoverPeers() {
 					continue
 				}
 
-				fmt.Printf("Falha ao conectar com %s: %s\n", peerInfo.ID, err)
+				node.LogMessage("Falha ao conectar com %s: %s", peerInfo.ID, err)
 				reconnectAttempts[peerInfo.ID] = 1
 				lastAttempt[peerInfo.ID] = now
 				continue
 			}
 
-			fmt.Printf("Conectado com sucesso a novo peer: %s\n", peerInfo.ID)
+			node.LogMessage("Conectado com sucesso a novo peer: %s", peerInfo.ID)
 			node.setConnected(peerInfo.ID, true)
 		}
 
@@ -726,46 +727,49 @@ func (node *Node) Start() error {
 
 	_, err = relay.New(host)
 	if err != nil {
-		fmt.Printf("Aviso: falha ao iniciar serviço relay: %s\n", err)
+		node.LogMessage("Aviso: falha ao iniciar serviço relay: %s", err)
 	}
 
 	ids, ok := host.Peerstore().(identify.IDService)
 	if !ok {
-		fmt.Println("Aviso: host não fornece serviço de identificação compatível")
+		node.LogMessage("Aviso: host não fornece serviço de identificação compatível")
 	} else {
 		addrF := func() []ma.Multiaddr { return host.Addrs() }
 		_, err = holepunch.NewService(host, ids, addrF)
 		if err != nil {
-			fmt.Printf("Aviso: falha ao iniciar serviço de hole punch: %s\n", err)
+			node.LogMessage("Aviso: falha ao iniciar serviço de hole punch: %s", err)
 		} else {
-			fmt.Println("Serviço de hole punch iniciado com sucesso")
+			node.LogMessage("Serviço de hole punch iniciado com sucesso")
 		}
 	}
 
 	err = node.setupMDNS()
 	if err != nil {
-		fmt.Printf("Aviso: falha ao iniciar serviço mDNS: %s\n", err)
+		node.LogMessage("Aviso: falha ao iniciar serviço mDNS: %s", err)
 	}
 
-	fmt.Printf("Peer ID: %s\n", host.ID())
+	node.LogMessage("Peer ID: %s", host.ID())
 	for _, a := range host.Addrs() {
-		fmt.Printf("Address: %s/p2p/%s\n", a, host.ID())
+		node.LogMessage("Address: %s/p2p/%s", a, host.ID())
 	}
 
 	host.Network().Notify(&network.NotifyBundle{
 		DisconnectedF: func(n network.Network, c network.Conn) {
 			pid := c.RemotePeer()
 			node.setConnected(pid, false)
+			node.LogMessage("Peer desconectado: %s", pid)
 			go func() {
 				err := host.Connect(node.ctx, peer.AddrInfo{ID: pid})
 				if err == nil {
 					node.setConnected(pid, true)
+					node.LogMessage("Reconectado com peer: %s", pid)
 				}
 			}()
 		},
 		ConnectedF: func(n network.Network, c network.Conn) {
 			pid := c.RemotePeer()
 			node.setConnected(pid, true)
+			node.LogMessage("Novo peer conectado: %s", pid)
 		},
 	})
 
@@ -797,6 +801,7 @@ func (node *Node) Start() error {
 		return fmt.Errorf("falha ao participar do tópico: %w", err)
 	}
 	node.topic = topic
+	node.LogMessage("Conectado ao tópico: %s", node.topicName)
 
 	return nil
 }
@@ -824,43 +829,43 @@ func (node *Node) PublishMessage(data []byte) error {
 
 // Stop para o nó P2P
 func (node *Node) Stop() {
-	fmt.Println("Iniciando encerramento do nó P2P...")
+	node.LogMessage("Iniciando encerramento do nó P2P...")
 
 	if node.host != nil {
-		fmt.Println("Salvando lista de peers...")
+		node.LogMessage("Salvando lista de peers...")
 		node.saveKnownPeers()
 	}
 
 	if node.cancel != nil {
-		fmt.Println("Cancelando contexto...")
+		node.LogMessage("Cancelando contexto...")
 		node.cancel()
 	}
 
 	if node.topic != nil {
-		fmt.Println("Fechando tópico...")
+		node.LogMessage("Fechando tópico...")
 	}
 
 	if node.pubsub != nil {
-		fmt.Println("Fechando sistema de publicação/assinatura...")
+		node.LogMessage("Fechando sistema de publicação/assinatura...")
 	}
 
 	if node.dht != nil {
-		fmt.Println("Fechando DHT...")
+		node.LogMessage("Fechando DHT...")
 		err := node.dht.Close()
 		if err != nil {
-			fmt.Printf("Erro ao fechar DHT: %s\n", err)
+			node.LogMessage("Erro ao fechar DHT: %s", err)
 		}
 	}
 
 	if node.host != nil {
-		fmt.Println("Fechando host libp2p...")
+		node.LogMessage("Fechando host libp2p...")
 		err := node.host.Close()
 		if err != nil {
-			fmt.Printf("Erro ao fechar host: %s\n", err)
+			node.LogMessage("Erro ao fechar host: %s", err)
 		}
 	}
 
-	fmt.Println("Nó P2P encerrado com sucesso")
+	node.LogMessage("Nó P2P encerrado com sucesso")
 }
 
 // GetID retorna o ID do peer do nó
@@ -918,4 +923,99 @@ func (n *Node) OnlinePeers(ctx context.Context) ([]peer.ID, error) {
 		}
 	}
 	return ready, nil
+}
+
+// InitLogFile inicializa o arquivo de log
+func (node *Node) InitLogFile(logPath string) error {
+	// Se já existe um arquivo de log aberto, fecha primeiro
+	if node.logFile != nil {
+		node.logFile.Close()
+	}
+
+	// Cria ou trunca o arquivo de log
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("falha ao criar arquivo de log: %w", err)
+	}
+
+	node.logFile = file
+	// Escreve cabeçalho do log
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	_, err = fmt.Fprintf(node.logFile, "[%s] Sessão de log iniciada\n", timestamp)
+	return err
+}
+
+// LogMessage registra uma mensagem no arquivo de log
+func (node *Node) LogMessage(format string, args ...interface{}) {
+	if node.logFile == nil {
+		return
+	}
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(node.logFile, "[%s] %s\n", timestamp, msg)
+}
+
+// CloseLogFile fecha o arquivo de log
+func (node *Node) CloseLogFile() {
+	if node.logFile != nil {
+		node.LogMessage("Sessão de log encerrada")
+		node.logFile.Close()
+		node.logFile = nil
+	}
+}
+
+// ProcessCommand processa comandos especiais iniciados com "!"
+func (node *Node) ProcessCommand(command string) (string, error) {
+	// Verifica se é realmente um comando
+	if !strings.HasPrefix(command, "!") {
+		return "", fmt.Errorf("não é um comando")
+	}
+
+	// Remove o prefixo "!"
+	cmdText := strings.TrimPrefix(command, "!")
+	// Divide pelo primeiro espaço para separar o comando dos argumentos
+	parts := strings.SplitN(cmdText, " ", 2)
+	cmd := parts[0]
+
+	// Argumento opcional
+	var arg string
+	if len(parts) > 1 {
+		arg = parts[1]
+	}
+
+	// Log do comando recebido
+	node.LogMessage("Comando recebido: %s (arg: %s)", cmd, arg)
+
+	// Processa cada comando específico
+	switch strings.ToLower(cmd) {
+	case "op":
+		// Comando para listar peers online
+		return node.handleOnlinePeersCommand()
+	default:
+		return fmt.Sprintf("Comando desconhecido: %s", cmd), nil
+	}
+}
+
+// handleOnlinePeersCommand implementa o comando !op para listar peers online
+func (node *Node) handleOnlinePeersCommand() (string, error) {
+	ctx, cancel := context.WithTimeout(node.ctx, 5*time.Second)
+	defer cancel()
+
+	peers, err := node.OnlinePeers(ctx)
+	if err != nil {
+		return "", fmt.Errorf("erro ao obter peers online: %w", err)
+	}
+
+	if len(peers) == 0 {
+		return "Nenhum peer online encontrado.", nil
+	}
+
+	result := fmt.Sprintf("Peers online (%d):\n", len(peers))
+	for i, p := range peers {
+		result += fmt.Sprintf("%d. %s\n", i+1, p.String())
+	}
+
+	node.LogMessage("Comando !op executado: %d peers encontrados", len(peers))
+	return result, nil
 }
