@@ -27,32 +27,32 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-// KnownPeer representa um peer conhecido pelo nó
-type KnownPeer struct {
+// knownPeer representa um peer conhecido pelo nó
+type knownPeer struct {
 	Addr                  string    `json:"addr"`
 	LastSeen              time.Time `json:"last_seen"`
 	SuccessfulConnections int       `json:"successful_connections"`
 }
 
-// KnownPeers contém a lista de peers conhecidos pelo nó
+// knownPeers contém a lista de peers conhecidos pelo nó
 type KnownPeers struct {
-	Peers        map[string]KnownPeer `json:"peers"`
+	Peers        map[string]knownPeer `json:"peers"`
 	LastModified time.Time            `json:"last_modified"`
 }
 
-// MDNSNotifee é um manipulador para notificações mDNS
-type MDNSNotifee struct {
+// mdnsNotifee é um manipulador para notificações mDNS
+type mdnsNotifee struct {
 	node *Node
 }
 
 // Constantes para a configuração do nó P2P
 const (
-	DefaultKeyFile       = "node.key"
-	DefaultPeersFile     = "known_peers.json"
-	MaxReconnectAttempts = 10
-	InitialBackoff       = 1 * time.Second
-	MaxBackoff           = 60 * time.Second
-	MDNSServiceTag       = "p2pchat-poc"
+	defaultKeyFile       = "node.key"
+	defaultPeersFile     = "known_peers.json"
+	maxReconnectAttempts = 10
+	initialBackoff       = 1 * time.Second
+	maxBackoff           = 60 * time.Second
+	mdnsServiceTag       = "p2pchat-poc"
 )
 
 // Node representa um nó P2P completo
@@ -70,9 +70,9 @@ type Node struct {
 	lastSavedPeers  KnownPeers
 	peersFile       string
 	pubsub          *pubsub.PubSub
-	staticRelays    []string
 	topic           *pubsub.Topic
 	topicName       string
+	staticRelays    []string
 }
 
 // NewNode cria uma nova instância de um nó P2P
@@ -87,12 +87,12 @@ func NewNode(topicName, keyFile, peersFile string) *Node {
 		ignore:       make(map[peer.ID]bool),
 		ctx:          ctx,
 		cancel:       cancel,
-		staticRelays: DefaultStaticRelays(),
+		staticRelays: defaultStaticRelays(),
 	}
 }
 
-// DefaultStaticRelays retorna uma lista de relays estáticos padrão
-func DefaultStaticRelays() []string {
+// defaultStaticRelays retorna uma lista de relays estáticos padrão
+func defaultStaticRelays() []string {
 	return []string{
 		"/ip4/147.75.80.110/tcp/4001/p2p/QmbFgm5rao4mLdUAaCPgRGRoqyMKfK2gCgQaT77PmPjsEY",
 		"/ip4/147.75.195.153/tcp/4001/p2p/QmW9m57aiBDHAkKj9nmFSEn7ZqrcF1fZS4bipsTCHburei",
@@ -106,15 +106,15 @@ func (node *Node) SetStaticRelays(relays []string) {
 	node.staticRelays = relays
 }
 
-// IsConnected verifica se o nó está conectado a um peer específico
-func (node *Node) IsConnected(peerID peer.ID) bool {
+// isConnected verifica se o nó está conectado a um peer específico
+func (node *Node) isConnected(peerID peer.ID) bool {
 	node.connectedMutex.RLock()
 	defer node.connectedMutex.RUnlock()
 	return node.connected[peerID]
 }
 
-// SetConnected define o estado de conexão com um peer
-func (node *Node) SetConnected(peerID peer.ID, connected bool) {
+// setConnected define o estado de conexão com um peer
+func (node *Node) setConnected(peerID peer.ID, connected bool) {
 	node.connectedMutex.Lock()
 	defer node.connectedMutex.Unlock()
 	if connected {
@@ -124,16 +124,16 @@ func (node *Node) SetConnected(peerID peer.ID, connected bool) {
 	delete(node.connected, peerID)
 }
 
-// IsIgnored verifica se um peer está sendo ignorado
-func (node *Node) IsIgnored(peerID peer.ID) bool {
+// isIgnored verifica se um peer está sendo ignorado
+func (node *Node) isIgnored(peerID peer.ID) bool {
 	node.ignoreMutex.RLock()
 	ret := node.ignore[peerID]
 	node.ignoreMutex.RUnlock()
 	return ret
 }
 
-// SetIgnored define se um peer deve ser ignorado
-func (node *Node) SetIgnored(peerID peer.ID, ignored bool) {
+// setIgnored define se um peer deve ser ignorado
+func (node *Node) setIgnored(peerID peer.ID, ignored bool) {
 	node.ignoreMutex.Lock()
 	defer node.ignoreMutex.Unlock()
 	if ignored {
@@ -143,8 +143,8 @@ func (node *Node) SetIgnored(peerID peer.ID, ignored bool) {
 	delete(node.ignore, peerID)
 }
 
-// GetConnectedPeers retorna a lista de peers conectados
-func (node *Node) GetConnectedPeers() []peer.ID {
+// getConnectedPeers retorna a lista de peers conectados
+func (node *Node) getConnectedPeers() []peer.ID {
 	node.connectedMutex.RLock()
 	defer node.connectedMutex.RUnlock()
 
@@ -175,8 +175,8 @@ func (node *Node) convertToAddrInfo(addresses []string) []peer.AddrInfo {
 	return addrInfos
 }
 
-// LoadKnownPeers carrega a lista de peers conhecidos do arquivo
-func (node *Node) LoadKnownPeers() []peer.AddrInfo {
+// loadKnownPeers carrega a lista de peers conhecidos do arquivo
+func (node *Node) loadKnownPeers() []peer.AddrInfo {
 	node.knownPeersMutex.RLock()
 	defer node.knownPeersMutex.RUnlock()
 
@@ -185,7 +185,7 @@ func (node *Node) LoadKnownPeers() []peer.AddrInfo {
 	data, err := os.ReadFile(node.peersFile)
 	if err != nil {
 		knownPeers = KnownPeers{
-			Peers:        make(map[string]KnownPeer),
+			Peers:        make(map[string]knownPeer),
 			LastModified: time.Now(),
 		}
 		node.lastSavedPeers = knownPeers
@@ -196,7 +196,7 @@ func (node *Node) LoadKnownPeers() []peer.AddrInfo {
 	if err != nil {
 		fmt.Printf("Erro ao desserializar peers conhecidos: %s\n", err)
 		knownPeers = KnownPeers{
-			Peers:        make(map[string]KnownPeer),
+			Peers:        make(map[string]knownPeer),
 			LastModified: time.Now(),
 		}
 	}
@@ -240,15 +240,15 @@ func (node *Node) LoadKnownPeers() []peer.AddrInfo {
 	return peers
 }
 
-// SaveKnownPeers salva a lista de peers conhecidos no arquivo
-func (node *Node) SaveKnownPeers() {
+// saveKnownPeers salva a lista de peers conhecidos no arquivo
+func (node *Node) saveKnownPeers() {
 	node.knownPeersMutex.Lock()
 	defer node.knownPeersMutex.Unlock()
 
 	var knownPeers KnownPeers
 	if node.lastSavedPeers.Peers == nil {
 		knownPeers = KnownPeers{
-			Peers:        make(map[string]KnownPeer),
+			Peers:        make(map[string]knownPeer),
 			LastModified: time.Now(),
 		}
 	} else {
@@ -293,7 +293,7 @@ func (node *Node) SaveKnownPeers() {
 				knownPeers.Peers[peerID] = existingPeer
 				changed = true
 			} else {
-				knownPeers.Peers[peerID] = KnownPeer{
+				knownPeers.Peers[peerID] = knownPeer{
 					Addr:                  fullAddr,
 					LastSeen:              now,
 					SuccessfulConnections: 1,
@@ -327,10 +327,10 @@ func (node *Node) SaveKnownPeers() {
 }
 
 // selectBestPeers seleciona os melhores peers com base em uma pontuação
-func selectBestPeers(peers map[string]KnownPeer, limit int) map[string]KnownPeer {
+func selectBestPeers(peers map[string]knownPeer, limit int) map[string]knownPeer {
 	type PeerRanking struct {
 		ID    string
-		Peer  KnownPeer
+		Peer  knownPeer
 		Score float64
 	}
 
@@ -353,7 +353,7 @@ func selectBestPeers(peers map[string]KnownPeer, limit int) map[string]KnownPeer
 		return rankings[i].Score > rankings[j].Score
 	})
 
-	result := make(map[string]KnownPeer)
+	result := make(map[string]knownPeer)
 	for i := 0; i < limit && i < len(rankings); i++ {
 		result[rankings[i].ID] = rankings[i].Peer
 	}
@@ -372,13 +372,13 @@ func isLocalAddress(addr ma.Multiaddr) bool {
 // nextBackoff calcula o próximo tempo de espera para nova tentativa
 func nextBackoff(attempt int) time.Duration {
 	attempt = min(attempt, 30)
-	backoffDuration := InitialBackoff * time.Duration(1<<uint(attempt))
-	backoffDuration = min(backoffDuration, MaxBackoff)
+	backoffDuration := initialBackoff * time.Duration(1<<uint(attempt))
+	backoffDuration = min(backoffDuration, maxBackoff)
 	return backoffDuration
 }
 
-// LoadOrCreateIdentity carrega ou cria uma nova identidade para o nó
-func (node *Node) LoadOrCreateIdentity() crypto.PrivKey {
+// loadOrCreateIdentity carrega ou cria uma nova identidade para o nó
+func (node *Node) loadOrCreateIdentity() crypto.PrivKey {
 	if _, err := os.Stat(node.keyFile); os.IsNotExist(err) {
 		fmt.Println("Arquivo de chaves não encontrado. Gerando novas chaves...")
 		priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
@@ -424,8 +424,8 @@ func (node *Node) saveKeyToFile(priv crypto.PrivKey) error {
 	return os.WriteFile(node.keyFile, keyBytes, 0600)
 }
 
-// InitDHT inicializa a tabela hash distribuída do nó
-func (node *Node) InitDHT() *dht.IpfsDHT {
+// initDHT inicializa a tabela hash distribuída do nó
+func (node *Node) initDHT() *dht.IpfsDHT {
 	kademliaDHT, err := dht.New(node.ctx, node.host, dht.MaxRecordAge(5*time.Second))
 	if err != nil {
 		panic(err)
@@ -453,7 +453,7 @@ func (node *Node) InitDHT() *dht.IpfsDHT {
 }
 
 // HandlePeerFound é chamado quando um peer é descoberto via mDNS
-func (n *MDNSNotifee) HandlePeerFound(pi peer.AddrInfo) {
+func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	if pi.ID == n.node.host.ID() {
 		return
 	}
@@ -467,12 +467,12 @@ func (n *MDNSNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	}
 
 	fmt.Printf("Conectado via mDNS com %s\n", pi.ID)
-	n.node.SetConnected(pi.ID, true)
+	n.node.setConnected(pi.ID, true)
 }
 
-// SetupMDNS configura o serviço de descoberta local mDNS
-func (node *Node) SetupMDNS() error {
-	service := mdns.NewMdnsService(node.host, MDNSServiceTag, &MDNSNotifee{node: node})
+// setupMDNS configura o serviço de descoberta local mDNS
+func (node *Node) setupMDNS() error {
+	service := mdns.NewMdnsService(node.host, mdnsServiceTag, &mdnsNotifee{node: node})
 	if service == nil {
 		return fmt.Errorf("falha ao criar serviço mDNS")
 	}
@@ -481,8 +481,8 @@ func (node *Node) SetupMDNS() error {
 	return nil
 }
 
-// DiscoverPeers inicia o processo de descoberta de peers
-func (node *Node) DiscoverPeers() {
+// discoverPeers inicia o processo de descoberta de peers
+func (node *Node) discoverPeers() {
 	reconnectAttempts := make(map[peer.ID]int)
 	lastAttempt := make(map[peer.ID]time.Time)
 
@@ -493,7 +493,7 @@ func (node *Node) DiscoverPeers() {
 		for {
 			select {
 			case <-ticker.C:
-				node.SaveKnownPeers()
+				node.saveKnownPeers()
 			case <-node.ctx.Done():
 				return
 			}
@@ -501,7 +501,7 @@ func (node *Node) DiscoverPeers() {
 	}()
 
 	if node.dht == nil {
-		node.InitDHT()
+		node.initDHT()
 	}
 	routingDiscovery := drouting.NewRoutingDiscovery(node.dht)
 
@@ -515,7 +515,7 @@ func (node *Node) DiscoverPeers() {
 
 		dutil.Advertise(node.ctx, routingDiscovery, node.topicName)
 
-		knownPeers := node.LoadKnownPeers()
+		knownPeers := node.loadKnownPeers()
 		now := time.Now()
 
 		for _, peerInfo := range knownPeers {
@@ -523,13 +523,13 @@ func (node *Node) DiscoverPeers() {
 				continue
 			}
 
-			if node.IsConnected(peerInfo.ID) {
+			if node.isConnected(peerInfo.ID) {
 				continue
 			}
 
-			if attempts, exists := reconnectAttempts[peerInfo.ID]; exists && attempts >= MaxReconnectAttempts {
+			if attempts, exists := reconnectAttempts[peerInfo.ID]; exists && attempts >= maxReconnectAttempts {
 				fmt.Printf("Desistindo de reconexão com %s após %d tentativas\n", peerInfo.ID, attempts)
-				node.SetIgnored(peerInfo.ID, true)
+				node.setIgnored(peerInfo.ID, true)
 				continue
 			}
 
@@ -545,9 +545,9 @@ func (node *Node) DiscoverPeers() {
 			err := node.host.Connect(node.ctx, peerInfo)
 			if err == nil {
 				fmt.Printf("Reconectado com sucesso ao peer conhecido: %s\n", peerInfo.ID)
-				node.SetConnected(peerInfo.ID, true)
+				node.setConnected(peerInfo.ID, true)
 				delete(reconnectAttempts, peerInfo.ID)
-				node.SetIgnored(peerInfo.ID, false)
+				node.setIgnored(peerInfo.ID, false)
 				delete(lastAttempt, peerInfo.ID)
 			} else {
 				fmt.Printf("Falha na reconexão com %s: %s\n", peerInfo.ID, err)
@@ -556,13 +556,13 @@ func (node *Node) DiscoverPeers() {
 			}
 		}
 
-		ignoredPeers := node.GetIgnoredPeers()
+		ignoredPeers := node.getIgnoredPeers()
 		for _, peerID := range ignoredPeers {
-			if node.IsConnected(peerID) {
+			if node.isConnected(peerID) {
 				continue
 			}
 
-			if attempts, exists := reconnectAttempts[peerID]; exists && attempts >= MaxReconnectAttempts {
+			if attempts, exists := reconnectAttempts[peerID]; exists && attempts >= maxReconnectAttempts {
 				continue
 			}
 
@@ -586,9 +586,9 @@ func (node *Node) DiscoverPeers() {
 			err = node.host.Connect(node.ctx, peerInfo)
 			if err == nil {
 				fmt.Printf("Reconexão bem-sucedida com peer anteriormente ignorado: %s\n", peerID)
-				node.SetConnected(peerID, true)
+				node.setConnected(peerID, true)
 				delete(reconnectAttempts, peerID)
-				node.SetIgnored(peerID, false)
+				node.setIgnored(peerID, false)
 				delete(lastAttempt, peerID)
 			} else {
 				fmt.Printf("Falha na reconexão com peer ignorado %s: %s\n", peerID, err)
@@ -609,18 +609,18 @@ func (node *Node) DiscoverPeers() {
 				continue
 			}
 
-			if node.IsConnected(peerInfo.ID) {
+			if node.isConnected(peerInfo.ID) {
 				continue
 			}
 
-			if node.IsIgnored(peerInfo.ID) {
+			if node.isIgnored(peerInfo.ID) {
 				continue
 			}
 
 			err := node.host.Connect(node.ctx, peerInfo)
 			if err != nil {
 				if err.Error() == "no addresses" {
-					node.SetIgnored(peerInfo.ID, true)
+					node.setIgnored(peerInfo.ID, true)
 					continue
 				}
 
@@ -631,15 +631,15 @@ func (node *Node) DiscoverPeers() {
 			}
 
 			fmt.Printf("Conectado com sucesso a novo peer: %s\n", peerInfo.ID)
-			node.SetConnected(peerInfo.ID, true)
+			node.setConnected(peerInfo.ID, true)
 		}
 
 		time.Sleep(10 * time.Second)
 	}
 }
 
-// GetIgnoredPeers retorna a lista de peers ignorados
-func (node *Node) GetIgnoredPeers() []peer.ID {
+// getIgnoredPeers retorna a lista de peers ignorados
+func (node *Node) getIgnoredPeers() []peer.ID {
 	node.ignoreMutex.RLock()
 	defer node.ignoreMutex.RUnlock()
 
@@ -652,7 +652,7 @@ func (node *Node) GetIgnoredPeers() []peer.ID {
 
 // Start inicia o nó P2P
 func (node *Node) Start() error {
-	priv := node.LoadOrCreateIdentity()
+	priv := node.loadOrCreateIdentity()
 	staticRelaysInfo := node.convertToAddrInfo(node.staticRelays)
 
 	opts := []libp2p.Option{
@@ -693,7 +693,7 @@ func (node *Node) Start() error {
 		}
 	}
 
-	err = node.SetupMDNS()
+	err = node.setupMDNS()
 	if err != nil {
 		fmt.Printf("Aviso: falha ao iniciar serviço mDNS: %s\n", err)
 	}
@@ -706,21 +706,21 @@ func (node *Node) Start() error {
 	host.Network().Notify(&network.NotifyBundle{
 		DisconnectedF: func(n network.Network, c network.Conn) {
 			pid := c.RemotePeer()
-			node.SetConnected(pid, false)
+			node.setConnected(pid, false)
 			go func() {
 				err := host.Connect(node.ctx, peer.AddrInfo{ID: pid})
 				if err == nil {
-					node.SetConnected(pid, true)
+					node.setConnected(pid, true)
 				}
 			}()
 		},
 		ConnectedF: func(n network.Network, c network.Conn) {
 			pid := c.RemotePeer()
-			node.SetConnected(pid, true)
+			node.setConnected(pid, true)
 		},
 	})
 
-	go node.DiscoverPeers()
+	go node.discoverPeers()
 
 	ps, err := pubsub.NewGossipSub(
 		node.ctx,
@@ -779,7 +779,7 @@ func (node *Node) Stop() {
 
 	if node.host != nil {
 		fmt.Println("Salvando lista de peers...")
-		node.SaveKnownPeers()
+		node.saveKnownPeers()
 	}
 
 	if node.cancel != nil {
